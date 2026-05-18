@@ -9,13 +9,22 @@ import openai
 
 from agents.system_prompt import SYSTEM_PROMPT
 
+_api_key = os.getenv("OPENAI_API_KEY", "")
+
+# Explicitly set Authorization header — some proxy setups (LiteLLM) don't
+# pick up the key from the openai SDK's internal auth flow reliably.
 _client = openai.OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY", "placeholder"),
+    api_key=_api_key if _api_key else "sk-placeholder",
     base_url="http://litellm-production.eba-pvykax23.eu-west-1.elasticbeanstalk.com",
+    default_headers={"Authorization": f"Bearer {_api_key}"} if _api_key else {},
 )
 
 
 def get_llm_actions(compressed_state: str, observation: dict, day: int) -> list[dict]:
+    if not _api_key:
+        print(f"  LLM skipped on day {day}: OPENAI_API_KEY not set")
+        return []
+
     user_msg = f"Day {day}/30.\n\n{compressed_state}"
 
     try:
