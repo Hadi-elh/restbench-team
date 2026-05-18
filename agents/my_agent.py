@@ -39,7 +39,7 @@ def strategy(observation: dict, day: int) -> list[dict]:
     notes_state = parse_notes(observation.get("notes", ""))
 
     # 2. Get rule-based actions (ordering + operations)
-    ordering_actions = get_ordering_actions(observation, day)
+    ordering_actions, _ = get_ordering_actions(observation, day, notes_state)
     ops_actions, scenario_flags = get_operations_actions(observation, day, notes_state)
 
     # 3. Merge scenario flags into notes_state
@@ -51,11 +51,10 @@ def strategy(observation: dict, day: int) -> list[dict]:
     # 5. Get LLM optimization actions
     llm_actions = get_llm_actions(compressed, observation, day)
 
-    # 6. Dedup: remove LLM actions that conflict with rule actions
-    #    Rules win on: place_order, set_staff_level
-    #    LLM wins on: set_price, set_marketing_spend, offer_daily_special, set_menu
-    rule_tools = {a["tool"] for a in ordering_actions + ops_actions}
-    safe_llm = [a for a in llm_actions if a["tool"] not in rule_tools]
+    # 6. Only accept LLM actions for tools it owns; rules own place_order + set_staff_level
+    RULE_OWNED_TOOLS = {"place_order", "set_staff_level"}
+    LLM_ALLOWED_TOOLS = {"set_price", "set_marketing_spend", "offer_daily_special", "set_menu", "run_happy_hour", "save_notes"}
+    safe_llm = [a for a in llm_actions if a["tool"] in LLM_ALLOWED_TOOLS]
 
     # 7. Update notes memory and append save_notes action
     updated_notes = build_notes(update_notes_state(notes_state, observation, day))
