@@ -85,10 +85,14 @@ def get_ordering_actions(
     # Build effective static reorder points — bumped during supply_crisis.
     scenario_flags = notes_state.get("scenario_flags", {}) or {}
     in_supply_crisis = bool(scenario_flags.get("supply_crisis"))
+    in_renovation = bool(scenario_flags.get("renovation"))
     if in_supply_crisis:
         effective_static = {k: v * SUPPLY_CRISIS_BUFFER for k, v in REORDER_POINT.items()}
+    elif in_renovation:
+        effective_static = {k: v * 0.6 for k, v in REORDER_POINT.items()}
     else:
         effective_static = dict(REORDER_POINT)
+    renovation_qty_mult = 0.7 if in_renovation else 1.0
 
     # ── Usable stock (batches expiring > 1 day from now) ──────────────────────
     usable_stock: dict[str, float] = {}
@@ -187,6 +191,7 @@ def get_ordering_actions(
         else:
             base_qty = ORDER_QTY.get(ingredient, 5.0)
 
+        base_qty *= renovation_qty_mult
         if in_supply_crisis:
             base_qty *= SUPPLY_CRISIS_BUFFER
 

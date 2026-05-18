@@ -32,8 +32,8 @@ def parse_notes(notes_str: str) -> dict:
     try:
         data = json.loads(notes_str)
         state = _default()
-        state["day_history"] = data.get("day_history", [])[-5:]
-        state["stockout_log"] = data.get("stockout_log", [])[-5:]
+        state["day_history"] = data.get("day_history", [])[-7:]
+        state["stockout_log"] = data.get("stockout_log", [])[-7:]
         state["supplier_flags"] = {
             k: v for k, v in data.get("supplier_flags", {}).items()
             if v in VALID_FLAGS
@@ -59,7 +59,7 @@ def parse_notes(notes_str: str) -> dict:
                 if isinstance(e, dict)
                 and isinstance(e.get("day"), (int, float))
                 and isinstance(e.get("consumption"), dict)
-            ][-5:]
+            ][-7:]
         else:
             state["recent_consumption"] = []
         return state
@@ -69,14 +69,14 @@ def parse_notes(notes_str: str) -> dict:
 
 def build_notes(state: dict) -> str:
     payload = {
-        "day_history": state.get("day_history", [])[-5:],
-        "stockout_log": state.get("stockout_log", [])[-5:],
+        "day_history": state.get("day_history", [])[-7:],
+        "stockout_log": state.get("stockout_log", [])[-7:],
         "supplier_flags": state.get("supplier_flags", {}),
         "scenario_flags": state.get("scenario_flags", _default()["scenario_flags"]),
         "happy_hour_streak": state.get("happy_hour_streak", 0),
         "staff_level": state.get("staff_level", 8),
         "revenue_trend": state.get("revenue_trend", "stable"),
-        "recent_consumption": state.get("recent_consumption", [])[-5:],
+        "recent_consumption": state.get("recent_consumption", [])[-7:],
     }
     result = json.dumps(payload, separators=(",", ":"))
     if len(result) <= 4000:

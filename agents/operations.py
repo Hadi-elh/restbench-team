@@ -86,7 +86,7 @@ _BASE_STAFF_BY_DAY: dict[str, int] = {
 
 _STAFF_MIN = 3
 _STAFF_MAX = 15
-_RENOVATION_STAFF_CAP = 5
+_RENOVATION_STAFF_CAP = 4
 _MENU_MIN_DISHES = 5
 _PRICE_SLACK = 0.001  # EUR tolerance for the 0.8x..1.2x band
 
@@ -173,6 +173,7 @@ def _compute_staff_target(
     active_menu: list[str],
     cash: float,
     revenue_trend: str = "stable",
+    notes_state: dict | None = None,
 ) -> int:
     """Derive the desired staff level from contextual signals."""
     target = _BASE_STAFF_BY_DAY.get(day_of_week, 6)
@@ -195,7 +196,12 @@ def _compute_staff_target(
     # Renovation reduces covers, so cap the upper end before the walkout
     # override (walkout override may still push above this cap).
     if scenario_flags.get("renovation"):
-        target = min(target, _RENOVATION_STAFF_CAP)
+        days_since_reno = notes_state.get("days_since_renovation", -1) if notes_state else -1
+        if isinstance(days_since_reno, (int, float)) and 0 <= days_since_reno < 12:
+            # Still inside the 12-day renovation window — hard-cap at 4
+            target = max(_STAFF_MIN, min(target, _RENOVATION_STAFF_CAP))
+        else:
+            target = min(target, _RENOVATION_STAFF_CAP)
 
     # Walkout override: force +2 regardless of other modifiers.
     if walkout_band in ("Some", "Many"):
@@ -532,6 +538,7 @@ def get_operations_actions(
         active_menu=active_menu,
         cash=cash_now,
         revenue_trend=revenue_trend,
+        notes_state=notes_state,
     )
     if staff_target != current_staff:
         staff_actions.append(
