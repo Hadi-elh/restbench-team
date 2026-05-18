@@ -18,7 +18,8 @@ DEFAULT_STATE = {
     },
     "happy_hour_streak": 0,
     "staff_level": 8,
-    "revenue_trend": "stable"
+    "revenue_trend": "stable",
+    "recent_consumption": [],
 }
 
 VALID_TRENDS = {"improving", "stable", "declining"}
@@ -51,6 +52,16 @@ def parse_notes(notes_str: str) -> dict:
         state["staff_level"] = int(level) if isinstance(level, (int, float)) and 3 <= level <= 15 else 8
         trend = data.get("revenue_trend", "stable")
         state["revenue_trend"] = trend if trend in VALID_TRENDS else "stable"
+        raw_rc = data.get("recent_consumption", [])
+        if isinstance(raw_rc, list):
+            state["recent_consumption"] = [
+                e for e in raw_rc
+                if isinstance(e, dict)
+                and isinstance(e.get("day"), (int, float))
+                and isinstance(e.get("consumption"), dict)
+            ][-5:]
+        else:
+            state["recent_consumption"] = []
         return state
     except Exception:
         return _default()
@@ -64,11 +75,17 @@ def build_notes(state: dict) -> str:
         "scenario_flags": state.get("scenario_flags", _default()["scenario_flags"]),
         "happy_hour_streak": state.get("happy_hour_streak", 0),
         "staff_level": state.get("staff_level", 8),
-        "revenue_trend": state.get("revenue_trend", "stable")
+        "revenue_trend": state.get("revenue_trend", "stable"),
+        "recent_consumption": state.get("recent_consumption", [])[-5:],
     }
     result = json.dumps(payload, separators=(",", ":"))
     if len(result) <= 4000:
         return result
+    payload["recent_consumption"] = payload["recent_consumption"][-3:]
+    result = json.dumps(payload, separators=(",", ":"))
+    if len(result) <= 4000:
+        return result
+    payload["recent_consumption"] = []
     payload["day_history"] = payload["day_history"][-3:]
     result = json.dumps(payload, separators=(",", ":"))
     if len(result) <= 4000:
@@ -105,20 +122,44 @@ def update_supplier_flags(supplier_flags: dict, delivery_history: list) -> dict:
         if not name:
             continue
         recent_by_supplier.setdefault(name, []).append(d)
+
     for supplier, deliveries in recent_by_supplier.items():
         deliveries_sorted = sorted(deliveries, key=lambda x: x.get("delivery_day", 0))
-        last = deliveries_sorted[-1]
-        ordered = last.get("ordered_kg", 0)
-        delivered = last.get("delivered_kg", 0)
-        perfect = ordered > 0 and delivered >= ordered
-        if perfect:
-            flags[supplier] = "ok"
-        else:
-            current = flags.get(supplier, "ok")
-            if current == "unreliable":
+        window = deliveries_sorted[-5:]
+
+        def _is_partial(d: dict) -> bool:
+            ordered = d.get("ordered_kg", 0) or 0
+            delivered = d.get("delivered_kg", 0) or 0
+            return ordered > 0 and delivered < ordered
+
+        partials = [d for d in window if _is_partial(d)]
+
+        # Blacklist only when 3+ shortfalls in last 5 AND avg ratio < 0.5.
+        if len(partials) >= 3:
+            avg_ratio = sum(
+                (d.get("delivered_kg", 0) or 0) / (d.get("ordered_kg", 1) or 1)
+                for d in partials
+            ) / len(partials)
+            if avg_ratio < 0.5:
                 flags[supplier] = "blacklisted"
-            elif current != "blacklisted":
-                flags[supplier] = "unreliable"
+                continue
+
+        # Mark ok when last delivery is perfect AND last 3 have no shortfalls.
+        last = window[-1]
+        last_3 = window[-3:]
+        last_perfect = (
+            (last.get("ordered_kg", 0) or 0) > 0
+            and (last.get("delivered_kg", 0) or 0) >= (last.get("ordered_kg", 0) or 0)
+        )
+        last_3_clean = not any(_is_partial(d) for d in last_3)
+        if last_perfect and last_3_clean:
+            flags[supplier] = "ok"
+            continue
+
+        # Otherwise: mark unreliable on any shortfall (keep blacklisted if already set).
+        if partials and flags.get(supplier) != "blacklisted":
+            flags[supplier] = "unreliable"
+
     return flags
 
 
@@ -140,7 +181,10 @@ def update_scenario_flags(scenario_flags: dict, alerts: list) -> dict:
 
 
 def build_day_entry(observation: dict, day: int) -> dict:
-    ss = observation.get("service_summary", {})
+    # NOTE: the live API can return service_summary=None on day 1 (no service yet),
+    # so we use `or {}` to coerce None into an empty dict. `dict.get(key, default)`
+    # only returns the default when the key is missing — not when the value is None.
+    ss = observation.get("service_summary") or {}
     return {
         "day": day,
         "revenue": observation.get("yesterday_revenue", 0),
@@ -150,26 +194,53 @@ def build_day_entry(observation: dict, day: int) -> dict:
     }
 
 
+def compute_consumption(observation: dict) -> dict[str, float]:
+    """Compute yesterday's ingredient consumption from dishes_sold × recipe quantities.
+
+    Returns ingredient -> kg consumed. Handles all three ingredient list shapes
+    documented in AGENT_CONTRACT (list[dict], dict[str, float], list[str]).
+    Returns {} when no dishes_sold data is present (day 1 / zero-cover days).
+    """
+    ss = observation.get("service_summary") or {}
+    dishes_sold = ss.get("dishes_sold", {}) or {}
+    if not dishes_sold:
+        return {}
+    menu_lookup: dict[str, dict] = {
+        d["name"]: d for d in (observation.get("menu_book", []) or []) if d.get("name")
+    }
+    consumption: dict[str, float] = {}
+    for dish, count in dishes_sold.items():
+        entry = menu_lookup.get(dish)
+        if not entry:
+            continue
+        ings = entry.get("ingredients") or []
+        if isinstance(ings, list):
+            for item in ings:
+                if isinstance(item, dict):
+                    ingredient = item.get("ingredient") or item.get("name")
+                    qty = float(item.get("quantity_kg", 0) or 0)
+                    if ingredient and qty > 0:
+                        consumption[ingredient] = consumption.get(ingredient, 0.0) + count * qty
+        elif isinstance(ings, dict):
+            for ingredient, qty in ings.items():
+                qty = float(qty or 0)
+                if qty > 0:
+                    consumption[ingredient] = consumption.get(ingredient, 0.0) + count * qty
+    return consumption
+
+
 def build_stockout_entries(observation: dict, day: int) -> list:
-    ss = observation.get("service_summary", {})
-    unavailable = ss.get("dishes_unavailable_at", {})
-    entries = []
-    menu_book = {d["name"]: d for d in observation.get("menu_book", [])}
-    for dish, hour in unavailable.items():
-        recipe = menu_book.get(dish, {})
-        for ing in recipe.get("ingredients", []):
-            entries.append({
-                "day": day,
-                "ingredient": ing["ingredient"],
-                "hour_ran_out": hour
-            })
-    return entries
+    # Schema must match what operations._derive_stockout_streak reads:
+    # {"day": int, "dish": str, "hour": int}
+    ss = observation.get("service_summary", {}) or {}
+    unavailable = ss.get("dishes_unavailable_at", {}) or {}
+    return [{"day": day, "dish": dish, "hour": hour} for dish, hour in unavailable.items()]
 
 
 def get_best_daily_special(observation: dict) -> str:
     """Pick daily special by highest estimated revenue (count * current_price) from yesterday."""
-    ss = observation.get("service_summary", {})
-    dishes_sold = ss.get("dishes_sold", {})
+    ss = observation.get("service_summary") or {}
+    dishes_sold = ss.get("dishes_sold", {}) or {}
     menu_book = {d["name"]: d for d in observation.get("menu_book", [])}
     active_menu = observation.get("active_menu", [])
     best_dish = None
@@ -190,11 +261,11 @@ def get_price_actions(observation: dict, scenario_flags: dict) -> list:
     Returns empty list if no rule applies — let LLM decide.
     Priority: reputation recovery > walkout control > tourist season > inflation.
     """
-    ss = observation.get("service_summary", {})
+    ss = observation.get("service_summary") or {}
     walkout_band = ss.get("walkout_band", "None")
     reputation_band = observation.get("reputation_band", "Very Good")
-    menu_book = {d["name"]: d for d in observation.get("menu_book", [])}
-    active_menu = observation.get("active_menu", [])
+    menu_book = {d["name"]: d for d in observation.get("menu_book", []) or []}
+    active_menu = observation.get("active_menu", []) or []
 
     multiplier = None
     if reputation_band in ("Poor", "Fair"):
@@ -237,5 +308,6 @@ def _default() -> dict:
         },
         "happy_hour_streak": 0,
         "staff_level": 8,
-        "revenue_trend": "stable"
+        "revenue_trend": "stable",
+        "recent_consumption": [],
     }

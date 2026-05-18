@@ -132,12 +132,47 @@ def _detect_scenario_flags(
     return merged
 
 
+def _is_kitchen_dead(service_summary: dict, active_menu: list[str]) -> bool:
+    """Yesterday's service was effectively zero due to mass stockout.
+
+    Two signals must coincide: almost no covers AND at least half the active
+    menu ran out. This distinguishes "kitchen had no food" (cut staff) from
+    "service was slow" (add staff via walkout override).
+    """
+    try:
+        covers = int(service_summary.get("total_covers", 0) or 0)
+    except (TypeError, ValueError):
+        covers = 0
+    unavailable = service_summary.get("dishes_unavailable_at", {}) or {}
+    if not active_menu:
+        return False
+    ran_out_share = len(unavailable) / max(1, len(active_menu))
+    return covers <= 10 and ran_out_share >= 0.5
+
+
+def _is_struggling(service_summary: dict, revenue_trend: str) -> bool:
+    """Yesterday was low-traffic (not dead) AND trend is declining.
+
+    Signals a restaurant bleeding customers slowly — cut staff to 4 to
+    reduce burn while staying one above the absolute floor.
+    """
+    try:
+        covers = int(service_summary.get("total_covers", 0) or 0)
+    except (TypeError, ValueError):
+        covers = 0
+    return covers < 30 and revenue_trend == "declining"
+
+
 def _compute_staff_target(
     day_of_week: str,
     weather_today: str,
     reputation_band: str,
     walkout_band: str,
     scenario_flags: dict[str, bool],
+    service_summary: dict,
+    active_menu: list[str],
+    cash: float,
+    revenue_trend: str = "stable",
 ) -> int:
     """Derive the desired staff level from contextual signals."""
     target = _BASE_STAFF_BY_DAY.get(day_of_week, 6)
@@ -171,6 +206,18 @@ def _compute_staff_target(
         target = _STAFF_MIN
     if target > _STAFF_MAX:
         target = _STAFF_MAX
+
+    # Emergency overrides: check early before cash hits zero.
+    if cash < 8000:
+        if _is_kitchen_dead(service_summary, active_menu):
+            # Full stop-the-bleed: kitchen had no food, paying for staff who
+            # can't cook costs more than it saves.
+            return _STAFF_MIN
+        if _is_struggling(service_summary, revenue_trend):
+            # Low traffic + declining trend: hedge at 4 (one above floor)
+            # to preserve cash while keeping a skeleton crew for recovery.
+            return _STAFF_MIN + 1
+
     return target
 
 
@@ -442,6 +489,7 @@ def get_operations_actions(
     days_since_renovation: int = int(
         notes_state.get("days_since_renovation", -1)
     )
+    revenue_trend: str = str(notes_state.get("revenue_trend", "stable") or "stable")
 
     # --- Scenario detection (sticky merge). ---
     scenario_flags = _detect_scenario_flags(alerts, previous_scenario_flags)
@@ -473,12 +521,17 @@ def get_operations_actions(
     happy_hour_actions: list[dict] = []
 
     # --- Staffing. ---
+    cash_now: float = float(observation.get("cash", 0.0) or 0.0)
     staff_target = _compute_staff_target(
         day_of_week=day_of_week,
         weather_today=weather_today,
         reputation_band=reputation_band,
         walkout_band=walkout_band,
         scenario_flags=scenario_flags,
+        service_summary=service_summary,
+        active_menu=active_menu,
+        cash=cash_now,
+        revenue_trend=revenue_trend,
     )
     if staff_target != current_staff:
         staff_actions.append(

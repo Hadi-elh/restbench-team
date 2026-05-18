@@ -1,85 +1,139 @@
-"""Main agent entry point — combines rule-based ordering/ops with LLM optimization."""
+"""Main agent entry point — rule layers (ordering + operations + pricing) + LLM optimization.
+
+Action assembly order (matters for predictability, not engine correctness):
+    1. ordering_actions       — Amr's rule-based supply reorders
+    2. ops_actions            — Nadim's rule-based staffing / happy hour / etc.
+    3. rule_price_actions     — Hadi's rule-based pricing (only when a trigger rule fires)
+    4. rule_special_actions   — Hadi's rule-based daily special selection
+    5. safe_llm               — whatever the LLM returned, filtered to allowed tools
+    6. save_notes             — persisted memory, always last
+"""
 
 from __future__ import annotations
 
 try:
     from agents.ordering import get_ordering_actions
 except ImportError:
-    def get_ordering_actions(obs, day): return []
+    def get_ordering_actions(obs, day, notes_state=None):
+        return [], {}
 
 try:
     from agents.operations import get_operations_actions
 except ImportError:
-    def get_operations_actions(obs, day, notes_state): return [], {}
+    def get_operations_actions(obs, day, notes_state):
+        return [], {}
 
-try:
-    from agents.memory import parse_notes, build_notes
-except ImportError:
-    import json as _json
-
-    def parse_notes(s):
-        try:
-            return _json.loads(s) if s else {}
-        except Exception:
-            return {}
-
-    def build_notes(d):
-        try:
-            return _json.dumps(d)[:4000]
-        except Exception:
-            return ""
-
+from agents.memory import (
+    parse_notes,
+    build_notes,
+    compute_revenue_trend,
+    compute_consumption,
+    update_scenario_flags,
+    build_day_entry,
+    build_stockout_entries,
+    get_best_daily_special,
+    get_price_actions,
+)
 from agents.state_compressor import compress_observation
 from agents.llm_layer import get_llm_actions
 from agents.runner import run_game
 
 
 def strategy(observation: dict, day: int) -> list[dict]:
-    # 1. Parse notes memory
+    # 1. Parse persisted notes memory.
     notes_state = parse_notes(observation.get("notes", ""))
 
-    # 2. Get rule-based actions (ordering + operations)
-    ordering_actions, _ = get_ordering_actions(observation, day, notes_state)
-    ops_actions, scenario_flags = get_operations_actions(observation, day, notes_state)
+    # 2. Rule modules first (they own ordering + operations decisions).
+    ordering_actions, ordering_state = get_ordering_actions(observation, day, notes_state)
+    ops_actions_raw, ops_state = get_operations_actions(observation, day, notes_state)
+    # Strip offer_daily_special from ops — rule_special_actions (step 5) owns it exclusively
+    # to avoid emitting two identical tool calls per turn.
+    ops_actions = [a for a in ops_actions_raw if a.get("tool") != "offer_daily_special"]
 
-    # 3. Merge scenario flags into notes_state
-    notes_state["scenario_flags"] = scenario_flags
+    # 3. Merge module-owned state into notes_state at the TOP LEVEL (not nested).
+    # This is the bug-3 fix: previously the ops state dict was being stuffed
+    # under notes_state["scenario_flags"], nesting the real flags one level too
+    # deep and breaking sticky-flag reads on the next turn.
+    for k, v in (ops_state or {}).items():
+        notes_state[k] = v
+    for k, v in (ordering_state or {}).items():
+        notes_state[k] = v
 
-    # 4. Compress observation for LLM
+    # 4. Rule-based pricing (only triggers on certain rep/walkout/scenario states).
+    rule_price_actions = get_price_actions(
+        observation, notes_state.get("scenario_flags", {})
+    )
+
+    # 5. Rule-based daily special — always picks the best estimated-revenue dish.
+    rule_special_actions: list[dict] = []
+    special_dish = get_best_daily_special(observation)
+    if special_dish:
+        rule_special_actions.append(
+            {"tool": "offer_daily_special", "args": {"dish": special_dish}}
+        )
+
+    # 6. Compress observation for LLM context.
     compressed = compress_observation(observation, day, notes_state)
 
-    # 5. Get LLM optimization actions
+    # 7. LLM gets to optimize marketing / happy hour. Pricing only if rules didn't fire.
+    # NOTE: llm_pricing_failed is intentionally NOT passed to get_operations_actions because
+    # ops is called before the LLM (step 2). Mode A (out-of-bounds reset) in ops already
+    # catches any drifted prices. Mode B (full crash reset) is unreachable by design.
     llm_actions = get_llm_actions(compressed, observation, day)
 
-    # 6. Only accept LLM actions for tools it owns; rules own place_order + set_staff_level
-    RULE_OWNED_TOOLS = {"place_order", "set_staff_level"}
-    LLM_ALLOWED_TOOLS = {"set_price", "set_marketing_spend", "offer_daily_special", "run_happy_hour", "save_notes"}
-    safe_llm = [a for a in llm_actions if a["tool"] in LLM_ALLOWED_TOOLS]
+    # Tools the LLM may emit. Rules own ordering, staffing, daily special.
+    llm_allowed = {"set_marketing_spend", "run_happy_hour", "save_notes", "set_price"}
+    if rule_price_actions:
+        # Rule-based pricing fired today — don't let the LLM also touch prices.
+        llm_allowed.discard("set_price")
+    safe_llm = [a for a in llm_actions if a.get("tool") in llm_allowed]
 
-    # 7. Update notes memory and append save_notes action
-    updated_notes = build_notes(update_notes_state(notes_state, observation, day))
-    if updated_notes:
-        safe_llm.append({"tool": "save_notes", "args": {"text": updated_notes}})
+    # Suppress marketing spend when yesterday was dead or trend is declining —
+    # spending on marketing with no kitchen capacity or a shrinking customer base
+    # burns cash with zero return.
+    ss = observation.get("service_summary") or {}
+    dead_yesterday = (ss.get("total_covers", 0) or 0) <= 10
+    if dead_yesterday or notes_state.get("revenue_trend") == "declining":
+        safe_llm = [a for a in safe_llm if a.get("tool") != "set_marketing_spend"]
 
-    return ordering_actions + ops_actions + safe_llm
+    # 8. Update notes memory and append save_notes as the LAST action.
+    updated_state = update_notes_state(notes_state, observation, day)
+    save_action = {"tool": "save_notes", "args": {"text": build_notes(updated_state)}}
+
+    return (
+        ordering_actions
+        + ops_actions
+        + rule_price_actions
+        + rule_special_actions
+        + safe_llm
+        + [save_action]
+    )
 
 
 def update_notes_state(notes_state: dict, observation: dict, day: int) -> dict:
-    ss = observation.get("service_summary", {}) or {}
+    """Build the next-turn notes state using Hadi's helpers.
+
+    Keeps day_history and stockout_log to the last 5 entries each so the
+    serialized notes stay well under the 4000-char cap.
+    """
     history = notes_state.get("day_history", [])
-    history.append({
-        "day": day,
-        "revenue": observation.get("yesterday_revenue", 0),
-        "cash": observation.get("cash", 0),
-        "walkouts": ss.get("walkout_band", "None"),
-    })
-    notes_state["day_history"] = history[-5:]  # keep last 5
+    history.append(build_day_entry(observation, day))
+    notes_state["day_history"] = history[-5:]
 
     stockouts = notes_state.get("stockout_log", [])
-    for dish, hour in ss.get("dishes_unavailable_at", {}).items():
-        stockouts.append({"day": day, "dish": dish, "hour": hour})
+    stockouts.extend(build_stockout_entries(observation, day))
     notes_state["stockout_log"] = stockouts[-5:]
 
+    notes_state["revenue_trend"] = compute_revenue_trend(notes_state["day_history"])
+
+    rc = notes_state.get("recent_consumption", [])
+    rc.append({"day": day, "consumption": compute_consumption(observation)})
+    notes_state["recent_consumption"] = rc[-5:]
+
+    notes_state["scenario_flags"] = update_scenario_flags(
+        notes_state.get("scenario_flags", {}),
+        observation.get("alerts", []) or [],
+    )
     return notes_state
 
 

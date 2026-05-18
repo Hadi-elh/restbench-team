@@ -1,2 +1,4 @@
 httpx>=0.28
 litellm>=1.70
+openai>=1.0
+openai>=1.0
