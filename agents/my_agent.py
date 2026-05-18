@@ -1,12 +1,13 @@
-"""Main agent entry point — rule layers (ordering + operations + pricing) + LLM optimization.
+"""Main agent entry point — rule layers (ordering + operations + pricing + marketing) + LLM.
 
 Action assembly order (matters for predictability, not engine correctness):
-    1. ordering_actions       — Amr's rule-based supply reorders
-    2. ops_actions            — Nadim's rule-based staffing / happy hour / etc.
-    3. rule_price_actions     — Hadi's rule-based pricing (only when a trigger rule fires)
-    4. rule_special_actions   — Hadi's rule-based daily special selection
-    5. safe_llm               — whatever the LLM returned, filtered to allowed tools
-    6. save_notes             — persisted memory, always last
+    1. ordering_actions        — Amr's rule-based supply reorders
+    2. ops_actions             — Nadim's rule-based staffing / happy hour / etc.
+    3. rule_price_actions      — Hadi's rule-based pricing (multiplicative stack)
+    4. rule_marketing_actions  — Hadi's rule-based marketing spend
+    5. rule_special_actions    — Hadi's rule-based daily special selection
+    6. safe_llm                — whatever the LLM returned, filtered to allowed tools
+    7. save_notes              — persisted memory, always last
 """
 
 from __future__ import annotations
@@ -33,6 +34,8 @@ from agents.memory import (
     build_stockout_entries,
     get_best_daily_special,
     get_price_actions,
+    get_marketing_actions,
+    detect_drift_flags,
 )
 from agents.state_compressor import compress_observation
 from agents.llm_layer import get_llm_actions
@@ -59,9 +62,18 @@ def strategy(observation: dict, day: int) -> list[dict]:
     for k, v in (ordering_state or {}).items():
         notes_state[k] = v
 
-    # 4. Rule-based pricing (only triggers on certain rep/walkout/scenario states).
+    # 4. Rule-based pricing (multiplicative stack — fires whenever prices need moving).
     rule_price_actions = get_price_actions(
         observation, notes_state.get("scenario_flags", {})
+    )
+
+    # 4b. Drift detection and rule-based marketing spend.
+    drift_flags = detect_drift_flags(notes_state.get("day_history", []), notes_state)
+    notes_state["drift_flags"] = drift_flags
+    rule_marketing_actions = get_marketing_actions(
+        observation,
+        notes_state.get("scenario_flags", {}),
+        notes_state.get("revenue_trend", "stable"),
     )
 
     # 5. Rule-based daily special — always picks the best estimated-revenue dish.
@@ -75,26 +87,15 @@ def strategy(observation: dict, day: int) -> list[dict]:
     # 6. Compress observation for LLM context.
     compressed = compress_observation(observation, day, notes_state)
 
-    # 7. LLM gets to optimize marketing / happy hour. Pricing only if rules didn't fire.
-    # NOTE: llm_pricing_failed is intentionally NOT passed to get_operations_actions because
-    # ops is called before the LLM (step 2). Mode A (out-of-bounds reset) in ops already
-    # catches any drifted prices. Mode B (full crash reset) is unreachable by design.
+    # 7. LLM handles happy hour advisory. set_price only when multiplier stack didn't fire.
     llm_actions = get_llm_actions(compressed, observation, day)
 
-    # Tools the LLM may emit. Rules own ordering, staffing, daily special.
-    llm_allowed = {"set_marketing_spend", "run_happy_hour", "save_notes", "set_price"}
+    # Tools the LLM may emit. Rules own ordering, staffing, marketing, daily special.
+    llm_allowed = {"run_happy_hour", "save_notes", "set_price"}
     if rule_price_actions:
-        # Rule-based pricing fired today — don't let the LLM also touch prices.
+        # Multiplicative pricing fired today — LLM should not also touch prices.
         llm_allowed.discard("set_price")
     safe_llm = [a for a in llm_actions if a.get("tool") in llm_allowed]
-
-    # Suppress marketing spend when yesterday was dead or trend is declining —
-    # spending on marketing with no kitchen capacity or a shrinking customer base
-    # burns cash with zero return.
-    ss = observation.get("service_summary") or {}
-    dead_yesterday = (ss.get("total_covers", 0) or 0) <= 10
-    if dead_yesterday or notes_state.get("revenue_trend") == "declining":
-        safe_llm = [a for a in safe_llm if a.get("tool") != "set_marketing_spend"]
 
     # 8. Update notes memory and append save_notes as the LAST action.
     updated_state = update_notes_state(notes_state, observation, day)
@@ -104,6 +105,7 @@ def strategy(observation: dict, day: int) -> list[dict]:
         ordering_actions
         + ops_actions
         + rule_price_actions
+        + rule_marketing_actions
         + rule_special_actions
         + safe_llm
         + [save_action]

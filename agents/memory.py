@@ -256,29 +256,50 @@ def get_best_daily_special(observation: dict) -> str:
 
 
 def get_price_actions(observation: dict, scenario_flags: dict) -> list:
-    """
-    Hard-rule pricing. Returns set_price actions when a rule triggers.
-    Returns empty list if no rule applies — let LLM decide.
-    Priority: reputation recovery > walkout control > tourist season > inflation.
-    """
+    """Multiplicative pricing stack — always emits set_price for every active dish
+    whose price needs to move, rather than a single priority-wins rule."""
     ss = observation.get("service_summary") or {}
     walkout_band = ss.get("walkout_band", "None")
     reputation_band = observation.get("reputation_band", "Very Good")
+    customer_trend = observation.get("customer_trend", "Stable")
+    day_of_week = observation.get("day_of_week", "Monday")
+    days_remaining = observation.get("days_remaining", 30)
     menu_book = {d["name"]: d for d in observation.get("menu_book", []) or []}
     active_menu = observation.get("active_menu", []) or []
 
-    multiplier = None
-    if reputation_band in ("Poor", "Fair"):
-        multiplier = 0.90
-    elif walkout_band == "Many":
-        multiplier = 0.95
-    elif scenario_flags.get("tourist_season"):
-        multiplier = 1.10
-    elif scenario_flags.get("inflation"):
-        multiplier = 1.12
+    # Reputation layer
+    rep_mult = {
+        "Poor": 0.88, "Fair": 0.93, "Good": 1.00, "Very Good": 1.04, "Excellent": 1.07
+    }.get(reputation_band, 1.00)
 
-    if multiplier is None:
-        return []
+    # Walkout cap — don't raise prices when customers are already walking out
+    if walkout_band == "Many":
+        rep_mult = min(rep_mult, 0.95)
+
+    # Customer trend
+    trend_mult = {"Growing": 1.02, "Declining": 0.97}.get(customer_trend, 1.00)
+
+    # Day of week — capture weekend demand, discount slow days
+    if day_of_week in ("Friday", "Saturday", "Sunday"):
+        dow_mult = 1.08
+    elif day_of_week in ("Monday", "Tuesday"):
+        dow_mult = 0.97
+    else:
+        dow_mult = 1.00
+
+    # Scenario stacks — each applies independently
+    scenario_mult = 1.00
+    if scenario_flags.get("tourist_season"):
+        scenario_mult *= 1.08
+    if scenario_flags.get("inflation"):
+        scenario_mult *= 1.10
+    if scenario_flags.get("health_scare"):
+        scenario_mult *= 0.92
+
+    # End-game protection: preserve cash in final stretch
+    endgame_mult = 0.97 if days_remaining <= 5 else 1.00
+
+    multiplier = rep_mult * trend_mult * dow_mult * scenario_mult * endgame_mult
 
     actions = []
     for dish in active_menu:
@@ -288,10 +309,65 @@ def get_price_actions(observation: dict, scenario_flags: dict) -> list:
         if base_price <= 0:
             continue
         new_price = round(base_price * multiplier, 2)
-        new_price = max(base_price * 0.80, min(base_price * 1.20, new_price))
+        new_price = max(round(base_price * 0.80, 2), min(round(base_price * 1.20, 2), new_price))
         if abs(new_price - current_price) > 0.01:
             actions.append({"tool": "set_price", "args": {"dish": dish, "price": new_price}})
     return actions
+
+
+def get_marketing_actions(
+    observation: dict, scenario_flags: dict, revenue_trend: str
+) -> list:
+    """Rule-based marketing spend. Returns [] when conditions suppress spending."""
+    day_of_week = observation.get("day_of_week", "Monday")
+    cash = observation.get("cash", 0) or 0
+
+    if cash < 3000:
+        return []
+    if scenario_flags.get("supply_crisis"):
+        return []
+
+    base = {
+        "Monday": 100, "Tuesday": 100, "Wednesday": 120,
+        "Thursday": 150, "Friday": 250, "Saturday": 280, "Sunday": 220,
+    }.get(day_of_week, 120)
+
+    if scenario_flags.get("tourist_season"):
+        base += 100
+    if revenue_trend == "declining":
+        base = int(base * 1.4)
+    if scenario_flags.get("renovation"):
+        base = int(base * 0.6)
+
+    amount = min(base, 400)
+    return [{"tool": "set_marketing_spend", "args": {"amount": amount}}]
+
+
+def detect_drift_flags(day_history: list, notes_state: dict) -> dict:
+    """Detect operational drift patterns from recent day history."""
+    flags = notes_state.get("drift_flags", {})
+
+    revenues = [d.get("revenue", 0) for d in day_history[-3:]]
+    demand_slump = (
+        len(revenues) >= 3
+        and all(revenues[i] <= revenues[i - 1] for i in range(1, len(revenues)))
+        and revenues[-1] < 500
+    )
+
+    walkouts = [d.get("walkouts", "None") for d in day_history[-2:]]
+    capacity_strain = (
+        len(walkouts) == 2
+        and all(w in ("Some", "Many") for w in walkouts)
+    )
+
+    # Waste data not yet tracked in day_history — carry forward existing flag
+    waste_alarm = flags.get("waste_alarm", False)
+
+    return {
+        "demand_slump": demand_slump,
+        "capacity_strain": capacity_strain,
+        "waste_alarm": waste_alarm,
+    }
 
 
 def _default() -> dict:
