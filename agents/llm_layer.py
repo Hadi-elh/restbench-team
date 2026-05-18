@@ -10,7 +10,7 @@ import openai
 from agents.system_prompt import SYSTEM_PROMPT
 
 _client = openai.OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
+    api_key=os.getenv("OPENAI_API_KEY", "placeholder"),
     base_url="http://litellm-production.eba-pvykax23.eu-west-1.elasticbeanstalk.com",
 )
 

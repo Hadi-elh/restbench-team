@@ -53,7 +53,7 @@ def strategy(observation: dict, day: int) -> list[dict]:
 
     # 6. Only accept LLM actions for tools it owns; rules own place_order + set_staff_level
     RULE_OWNED_TOOLS = {"place_order", "set_staff_level"}
-    LLM_ALLOWED_TOOLS = {"set_price", "set_marketing_spend", "offer_daily_special", "set_menu", "run_happy_hour", "save_notes"}
+    LLM_ALLOWED_TOOLS = {"set_price", "set_marketing_spend", "offer_daily_special", "run_happy_hour", "save_notes"}
     safe_llm = [a for a in llm_actions if a["tool"] in LLM_ALLOWED_TOOLS]
 
     # 7. Update notes memory and append save_notes action
