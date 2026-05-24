@@ -1,0 +1,5 @@
+# RestBench Score Log — Team Spicy Meatballs — May 18 2026
+# Format: [HH:MM] agent_version — avg: N | best: scenario (score) | worst: scenario (score) | bankruptcies: none OR scenario+seed
+# Target: beat naive_rule baseline (~-15,000). Competitive: +15,000 to +35,000.
+# Final eval at 16:00 uses seeds 7,55,99 (NOT 42,88,123)
+
